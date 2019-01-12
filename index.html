@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html>
+
+	<head>
+
+		<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+		<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+		<meta http-equiv="Pragma" content="no-cache">
+		<meta http-equiv="Expires" content="0">
+
+		<title>twgl.js - twgl cube</title>
+		<style>
+			body {
+				margin: 0;
+				font-family: monospace;
+			}
+			#c {
+				margin: 0;
+				display: block;
+				width: 100vw;
+				height: 100vh;
+			}
+			#b {
+				position: absolute;
+				margin: 0;
+				top: 10px;
+				width: 100%;
+				text-align: center;
+				z-index: 2;
+			}
+		</style>
+
+	</head>
+
+	<body>
+
+		<canvas id="c"></canvas>
+
+		<script id="vs_depth" type="notjs">
+			uniform mat4 u_ViewProjection;
+			uniform mat4 u_world;
+			attribute vec3 position;
+			void main() {
+				gl_Position = u_ViewProjection * u_world * vec4(position,1.);
+			}
+		</script>
+		<script id="fs_depth" type="notjs">
+			precision mediump float;
+			void main() {
+				gl_FragColor = vec4(1.0);
+			}
+		</script>
+
+		<script id="vs_main" type="notjs">
+			precision lowp float;
+			attribute vec4 position;
+			attribute vec2 texcoord;
+			varying vec2 v_coord;
+			void main() {
+				v_coord = texcoord;
+				gl_Position = position;
+			}
+		</script>
+		<script id="fs_main" type="notjs">
+			precision lowp float;
+			varying vec2 v_coord;
+			uniform sampler2D u_diffuse;
+
+			const float RADIUS = 0.75;
+			const float SOFTNESS = 0.45;
+			const vec3 SEPIA = vec3(1.2, 1.0, 0.8);
+
+			//float smoothstep(float edge0, float edge1, float x) {
+			//	float t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+			//	return t * t * (3.0 - 2.0 * t);
+			//}
+
+			void main() {
+
+				vec2 tex_coord = v_coord * 2. - 1.;
+
+				vec2 position = v_coord - vec2(0.5);
+				float len = length(position);
+				float vignette = smoothstep(RADIUS, RADIUS-SOFTNESS, len);
+
+				gl_FragColor.xyz = texture2D(u_diffuse,v_coord).xyz;
+
+				gl_FragColor.xyz = mix(gl_FragColor.xyz, gl_FragColor.xyz * vignette, 0.5);
+				//gl_FragColor.xyz = vec3(dot(gl_FragColor.xyz, vec3(0.299, 0.587, 0.114)));
+
+				gl_FragColor.a = 1.;
+			}
+		</script>
+
+		<script id="vs_terrain" type="notjs">
+			precision highp float;
+			attribute vec2 positionXZ;
+			attribute float height;
+			attribute vec2 texcoord;
+			varying vec2 v_coord;
+			uniform mat4 u_ViewProjection;
+			uniform mat4 u_world;
+			void main() {
+				v_coord = texcoord;
+				gl_Position = position;
+			}
+		</script>
+		<script id="fs_terrain" type="notjs">
+			precision lowp float;
+			varying vec2 v_coord;
+			uniform sampler2D u_diffuse;
+
+			void main() {
+				vec2 tex_coord = v_coord * 2. - 1.;
+				gl_FragColor.xyz = vec3(1.);
+				gl_FragColor.a = 1.;
+			}
+		</script>
+
+		<script src="./lib/twgl-full.min.js"></script>
+		<script src="./lib/dat.gui.min.js"></script>
+		<script src="./lib/jquery-3.3.1.min.js"></script>
+
+		<script src="./lib/webgl-obj-loader.js"></script>
+		<script src="./lib/Stats.js"></script>
+		<script src="./lib/obj.js"></script>
+		<script src="./lib/helper.js"></script>
+		<script src="https://unpkg.com/gpu.js@1.10.2/bin/gpu.js"></script>
+		<!-- <script src="./lib/gpu.js"></script> -->
+
+		<script>
+			"use strict";
+
+			const fov = 60 * Math.PI / 180;
+			const zNear = 16;
+			const zFar = 256;
+			const sunNear = zNear;
+			const sunFar = zFar;
+			const up = [0,1,0];
+			const target = [0,0,0];
+			const world_spin_fac = 0.0001;
+			const DEPTH_DIMENSION = 4096;
+			const TERRAIN_RES = 128; // no greater than 2048
+			const NOISE_TEXTURE_RES = 2048;
+			const NOISE_TEXTURE_SEED = 4123.3451342;
+
+			//=============== Game code starts below this line ========================//
+
+			var gui = new dat.GUI();
+			var stats = new Stats();
+			var DEBUG = false;
+			document.body.appendChild( stats.dom );
+
+			const m4 = twgl.m4;
+			const v3 = twgl.v3;
+
+			const canvas = document.getElementById('c')
+			const gl = canvas.getContext("webgl", { alpha: true });
+			twgl.gl = gl;
+			var ext = {}; {//Get WebGL extension
+				ext['OES_element_index_uint'] = gl.getExtension('OES_element_index_uint');
+				ext['WEBGL_depth_texture'] = gl.getExtension('WEBGL_depth_texture');
+				ext['OES_texture_float'] = gl.getExtension('OES_texture_float');
+			}
+
+			const t = new timer();
+
+			const gpu_instance = {}; // to hold various gpu instance for different calculation
+			gpu_instance["noise_texture"] = createGPUInstance("noise_texture", [NOISE_TEXTURE_RES, NOISE_TEXTURE_RES]);
+			gpu_instance["terrain_mask"] = createGPUInstance("terrain_mask", [TERRAIN_RES, TERRAIN_RES], gl);
+
+			createOctNoiseFunction(gpu_instance["noise_texture"].gpu)
+			createOctNoiseFunction(gpu_instance["terrain_mask"].gpu)
+
+			{//Create Noise Texture Kernels
+				let gpu = gpu_instance["noise_texture"].gpu
+				let kernels = gpu_instance["noise_texture"].kernels
+
+				kernels["noise_texture"] = gpu.createKernel(function(seed) {
+					let res = noise3D(this.thread.x/this.output.x*16384.0, this.thread.y/this.output.y*16384.0, seed%131072.0);
+					res = clamp(res, 0, 1);
+					this.color(res, res, res)
+				}, {loopMaxIterations:100000,})
+				.setOutput([NOISE_TEXTURE_RES, NOISE_TEXTURE_RES])
+				.setGraphical(true);
+				//.setOutputToTexture(true)
+			}
+
+			{//Create Terrain Mask Kernels
+				let gpu = gpu_instance["terrain_mask"].gpu
+				let kernels = gpu_instance["terrain_mask"].kernels
+
+				kernels["terrain"] = gpu.createKernel(function(time, oct, persit) {
+					let res = octave3D(this.thread.x,this.thread.y, time, oct, persit)
+					res *= vignette(this.thread.x/this.output.x, this.thread.y/this.output.y)
+					return masking(res, 0.5)
+				}, {loopMaxIterations:100000,})
+				.setOutput([TERRAIN_RES, TERRAIN_RES])
+				.setOutputToTexture(true)
+
+				kernels["transpose"] = gpu.createKernel(function(m) {
+					return m[this.thread.x][this.thread.y];
+				})
+				.setOutput([TERRAIN_RES, TERRAIN_RES])
+				.setOutputToTexture(true);
+
+				kernels["GuassianBlur3x3"] = gpu.createKernel(function(m) {
+
+					let weight = 0.25;
+					let total = m[this.thread.y][this.thread.x] * 0.25;
+
+					if ( this.thread.y < this.output.y - 1 ) {
+						if ( this.thread.x < this.output.x - 1 ) {
+							weight += 0.0625
+							total += m[this.thread.y+1][this.thread.x+1] * 0.0625
+						}
+						if ( this.thread.x > 0 ) {
+							weight += 0.0625
+							total += m[this.thread.y+1][this.thread.x-1] * 0.0625
+						}
+						weight += 0.125
+						total += m[this.thread.y+1][this.thread.x] * 0.125
+					}
+
+					if ( this.thread.y > 0 ) {
+						if ( this.thread.x < this.output.x - 1 ) {
+							weight += 0.0625
+							total += m[this.thread.y-1][this.thread.x+1] * 0.0625
+						}
+						if ( this.thread.x > 0 ) {
+							weight += 0.0625
+							total += m[this.thread.y-1][this.thread.x-1] * 0.0625
+						}
+						weight += 0.125
+						total += m[this.thread.y-1][this.thread.x] * 0.125
+					}
+
+					if ( this.thread.x < this.output.x - 1 ) {
+						weight += 0.125
+						total += m[this.thread.y][this.thread.x+1] * 0.125
+					}
+					if ( this.thread.x > 0 ) {
+						weight += 0.125
+						total += m[this.thread.y][this.thread.x-1] * 0.125
+					}
+
+					return total/weight;
+
+				})
+				.setOutput([TERRAIN_RES, TERRAIN_RES])
+				.setOutputToTexture(true)
+
+				kernels["render"] = gpu.createKernel(function(m) {
+					let res = clamp(m[this.thread.y][this.thread.x], 0, 1)
+					this.color(res, res, res)
+				}, {loopMaxIterations:100000,})
+				.setOutput([TERRAIN_RES, TERRAIN_RES])
+				.setGraphical(true);
+
+				kernels["terrain_render"] = gpu.combineKernels(kernels["render"], kernels["terrain"],function(time, oct, persit) {
+					return 	kernels["render"](kernels["terrain"](time, oct, persit))
+				});
+			}
+
+			let game_noise_texture; {//Render noise texture
+				let gpu = gpu_instance["noise_texture"].gpu
+				let kernels = gpu_instance["noise_texture"].kernels
+
+				console.log(" [ "+t.timestamp().toPrecision(6)+" ] Start Rendering Noise Texture ... ")
+				kernels["noise_texture"](t.timestamp()*NOISE_TEXTURE_SEED)
+				console.log(" [ "+t.timestamp().toPrecision(6)+" ] Finished Rendering Noise Texture ... ")
+				game_noise_texture = gpu_instance["noise_texture"].renderToTexture(gl)
+				console.log(" [ "+t.timestamp().toPrecision(6)+" ] Binded Noise Texture for later use ... ")
+			}
+
+			let terrain_mask_texture; {// Render terrain mask texture
+				let gpu = gpu_instance["terrain_mask"].gpu
+				let kernels = gpu_instance["terrain_mask"].kernels
+
+				console.log(" [ "+t.timestamp().toPrecision(6)+" ] Generating Terrain Mask ... ")
+				//kernels["terrain_render"](1.234, 6, 1/1.3)
+				let g = kernels["render"](kernels["GuassianBlur3x3"](kernels["terrain"](1.234, 6, 1/1.3)))
+				console.log(g);
+				console.log(" [ "+t.timestamp().toPrecision(6)+" ] Finished generating Terrain Mask ... ")
+				terrain_mask_texture = g//gpu_instance["terrain_mask"].renderToTexture(gl, g);
+				console.log(" [ "+t.timestamp().toPrecision(6)+" ] Binded Terrain Mask Texture for later use ... ")
+			}
+
+			let fbi_shadow = depth_framebuffer_generator(gl, false, [DEPTH_DIMENSION, DEPTH_DIMENSION])
+			let fbi_main_screen = depth_framebuffer_generator(gl, true, [gl.canvas.width, gl.canvas.height])
+
+			const main_dis = {
+				programInfo: twgl.createProgramInfo(gl, ["vs_main", "fs_main"]),
+				bufferInfo	: twgl.primitives.createXYQuadBufferInfo(gl),
+				uniforms	: {
+					u_diffuse: twgl.createTexture(gl, {
+						min: gl.NEAREST,
+						mag: gl.NEAREST,
+						src: new Uint8Array([
+							255,   0,   0, 255,
+							255,   0, 255, 255,
+							0, 255,   0, 255,
+							0,   0, 255, 255,
+						]),
+					})
+				},
+				render	: function(twgl) {
+					twgl.gl.useProgram(this.programInfo.program);
+					twgl.setBuffersAndAttributes(gl, this.programInfo, this.bufferInfo);
+					twgl.setUniforms(this.programInfo, this.uniforms);
+					twgl.drawBufferInfo(twgl.gl, this.bufferInfo)
+				}
+			}
+
+			const shadowMapping = {
+				programInfo: twgl.createProgramInfo(gl, ["vs_depth", "fs_depth"]),
+				dimension: null,
+				uniforms: {
+					u_ViewProjection: null,
+					u_world: null,
+				},
+				render: function(twgl, bufferInfo) {
+					twgl.gl.useProgram(this.programInfo.program);
+					twgl.setBuffersAndAttributes(gl, this.programInfo, bufferInfo);
+					twgl.setUniforms(this.programInfo, this.uniforms);
+					twgl.gl.drawElements(gl.TRIANGLES, terrain.bufferInfo.numElements, gl.UNSIGNED_INT, 0);
+				}
+			}
+
+			{//WebGL parameters
+				gl.enable(gl.DEPTH_TEST);
+				gl.enable(gl.CULL_FACE);
+				gl.enable(gl.BLEND);
+				gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+				gl.clearColor(0.529,0.808,92.2,1.)
+				gl.clearDepth(1);
+			}
+
+			{//Window event initiation
+			}
+
+			let sunLoc = [-50, 20, 0]
+			let aspect = gl.canvas.clientWidth / gl.canvas.clientHeight;
+			let eye = [10, 40, -60];
+			let camera = m4.lookAt(eye, target, up);
+			let view = m4.inverse(camera);
+			let projection = m4.perspective(fov, aspect, zNear, zFar);
+			let viewProjection = m4.multiply(projection, view);
+
+			const sunSize = 50
+			let projection_shadow = m4.ortho(-sunSize, sunSize, -sunSize, sunSize, sunNear, sunFar);
+
+			{//Entity uniform initiation, only once
+
+			}
+
+			function render(time) {
+
+				time *= world_spin_fac;
+
+				if (twgl.resizeCanvasToDisplaySize(gl.canvas)) {
+
+					let w = gl.canvas.clientWidth
+					let h = gl.canvas.clientHeight
+
+					fbi_shadow.destroy(gl)
+					fbi_shadow = depth_framebuffer_generator(gl, false, [DEPTH_DIMENSION, DEPTH_DIMENSION])
+					fbi_main_screen.destroy(gl)
+					fbi_main_screen = depth_framebuffer_generator(gl, true, [w, h])
+
+					aspect =  w / h;
+					projection = m4.perspective(fov, aspect, zNear, zFar);
+					viewProjection = m4.multiply(projection, view);
+
+				}
+
+				const world = m4.rotationY(time);
+
+				{//render shadow map
+					shadowMapping.uniforms.u_ViewProjection = m4.multiply(projection_shadow, m4.inverse(m4.lookAt(sunLoc, target, up)));
+
+					fbi_shadow.setupFB(gl)
+						gl.cullFace(gl.FRONT);
+
+						gl.cullFace(gl.BACK);
+					fbi_shadow.tidyupFB(gl)
+				}
+
+				{//main screen rendering
+					fbi_main_screen.setupFB(gl)
+
+
+
+					fbi_main_screen.tidyupFB(gl)
+				}
+
+				{// draw screen to screen with after effects
+					main_dis.uniforms.u_diffuse = fbi_main_screen.colorTexture
+					main_dis.uniforms.u_diffuse = game_noise_texture
+					main_dis.uniforms.u_diffuse = terrain_mask_texture
+					gl.viewport(0, 0, gl.canvas.clientWidth, gl.canvas.clientHeight);
+					gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+					main_dis.render(twgl)
+				}
+
+			}
+
+			function animate(time) {
+				stats.begin();
+				render(time)
+				stats.end();
+				requestAnimationFrame( animate );
+			}
+			requestAnimationFrame( animate );
+
+		</script>
+
+	</body>
+</html>
